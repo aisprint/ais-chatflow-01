@@ -6,6 +6,8 @@ import requests  # 追加
 
 app = FastAPI()
 
+port = int(os.environ.get("PORT", 8080))
+
 @app.post("/extract-text-from-url/")
 async def extract_text_from_pdf_url(pdf_url: str):
     try:
@@ -27,3 +29,7 @@ async def extract_text_from_pdf_url(pdf_url: str):
         raise HTTPException(status_code=400, detail=f"PDFのダウンロードに失敗しました: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDFの処理中にエラーが発生しました: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=port)
