@@ -3,6 +3,7 @@ import requests
 from PyPDF2 import PdfReader
 from io import BytesIO
 import fitz  # PyMuPDF
+from typing import List
 
 app = FastAPI()
 
@@ -35,12 +36,22 @@ def extract_pdf(pdf_url: str):
 
 
 @app.get("/PyMuPDF")
-def extract_text_from_pdf(pdf_bytes):
-    doc = fitz.open("pdf", pdf_bytes.read())  # PyMuPDFでPDFを開く
+def extract_text_from_pdf(pdf_bytes: bytes):
+    """
+    PyMuPDFを使ってPDFからテキストを抽出するエンドポイント
+    """
+    doc = fitz.open("pdf", pdf_bytes)  # PyMuPDFでPDFを開く
     extracted_text = "\n".join([page.get_text() for page in doc])
     return extracted_text if extracted_text else "No text extracted"
+
 
 @app.get("/display-list/")
 def display_list(my_list: List[int]):
     print(my_list)
-    return
+    return {"list": my_list}
+
+
+# FastAPIアプリケーションを起動するためのstart command
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
