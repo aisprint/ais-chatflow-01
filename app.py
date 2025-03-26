@@ -42,4 +42,5 @@ def extract_text_from_pdf(pdf_bytes):
 
 @app.get("/display-list/")
 def display_list(my_list: List[int]):
-    return {"list": my_list}
+    print(my_list)
+    return
