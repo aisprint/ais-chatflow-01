@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 import PyPDF2
 import io
 import requests  # 追加
+import os
 
 app = FastAPI()
 

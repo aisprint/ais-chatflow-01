@@ -1,1 +1,1 @@
-web: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers ${UVICORN_WORKERS:-4}
+web: python main.py
