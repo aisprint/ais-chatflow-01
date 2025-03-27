@@ -72,13 +72,19 @@ async def extract_text_from_url(request: PdfRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"予期せぬエラーが発生しました: {str(e)}")
 
-if __name__ == "__main__":
+def run_server():
     port = int(os.environ.get("PORT", 8080))
     workers = int(os.environ.get("UVICORN_WORKERS", 1))
+    reload = os.environ.get("RELOAD", "false").lower() == "true"
+    
     uvicorn.run(
-        app,
+        "main:app",  # モジュール名:アプリケーション変数名の文字列形式
         host="0.0.0.0",
         port=port,
-        workers=workers,
+        workers=workers if not reload else 1,  # reload時はworkers=1
+        reload=reload,
         timeout_keep_alive=60
     )
+
+if __name__ == "__main__":
+    run_server()
