@@ -8,7 +8,7 @@ import traceback # エラー詳細表示のため
 import requests
 import PyPDF2
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, ConnectionFailure # MongoDB固有のエラー
@@ -88,12 +88,14 @@ def verify_admin(api_key: str = Header(..., alias="X-API-Key")):
     if api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Admin access required")
 
-def get_user(api_key: str = Header(..., alias="X-API-Key")):
-    # if not auth_db: # 修正前
-    if auth_db is None: # ★ 修正後
+def get_user(api_key: str = Body(..., description="User's API Key")):
+    """
+    Retrieves the user based on the API key provided in the request body.
+    """
+    if auth_db is None:
          raise HTTPException(status_code=503, detail="Database service unavailable")
     user = auth_db.users.find_one({"api_key": api_key})
-    if not user: # user は辞書 or None なので bool() 評価可能
+    if not user:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return user
 
