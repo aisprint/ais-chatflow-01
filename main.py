@@ -566,6 +566,7 @@ async def process_pdf( # asyncにするとバックグラウンドタスク等�
             "chunks_processed": processed_chunks_count,
             "chunks_inserted": inserted_count,
             "duplicates_removed": duplicates_removed_count,
+            "vector_index_name": index_name,
             "vector_index_status": index_status, # ★ 正しく設定されたステータス
         }
         # (エラー時のレスポンス調整)
