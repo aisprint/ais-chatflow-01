@@ -315,7 +315,7 @@ def register_user(request: UserRegister):
             raise HTTPException(status_code=409, detail="User already exists") # 409 Conflict
 
         db_info = MongoDBManager.create_user_db(request.supabase_user_id)
-        return {"api_key": db_info["api_key"]}
+        return {"api_key": db_info["api_key"], "db_name": db_info["db_name"]}
     except HTTPException as e:
          raise e
     except Exception as e:
