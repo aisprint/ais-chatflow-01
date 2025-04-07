@@ -9,7 +9,7 @@ import traceback # エラー詳細表示のため
 import requests
 import PyPDF2
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
+from fastapi import FastAPI, HTTPException, Header, Depends, Body, Response # Responseを追加
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, ConnectionFailure # MongoDB固有のエラー
@@ -84,6 +84,12 @@ except Exception as e: # Other unexpected connection errors
 # --- Data models ---
 class UserRegister(BaseModel):
     supabase_user_id: str = Field(..., min_length=1)
+
+# ★★★ /register エンドポイント用の新しいレスポンスモデル ★★★
+class RegisterResponse(BaseModel):
+    api_key: str
+    db_name: str
+    database_exist: bool = Field(..., description="True if the user database already existed, False if newly created.")
 
 class CollectionCreate(BaseModel):
     name: str = Field(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$") # Restrict collection names
@@ -262,7 +268,11 @@ def split_text_into_chunks(text: str, chunk_size: int = 1500, overlap: int = 100
                  current_pos += 1
                  continue # Move to the next word
              # Otherwise, if it's not the first word or the first word fits, proceed normally
-             last_valid_end_pos = current_pos + 1
+             # However, we must advance, so take at least one word if possible
+             if current_pos < len(words):
+                 last_valid_end_pos = current_pos + 1
+             else: # Reached end of words
+                 break
 
 
         # Slice words for the current chunk
@@ -292,16 +302,18 @@ def split_text_into_chunks(text: str, chunk_size: int = 1500, overlap: int = 100
         # If the overlap didn't move us forward enough (e.g., very short words, large overlap),
         # ensure we advance by at least one position relative to the *start* of the current chunk.
         # Also handle the case where last_valid_end_pos is the end of the list.
+        # If next_pos <= current_pos, it means overlap didn't move us forward, so advance by 1.
+        # Otherwise, use the calculated overlap_start_index.
         if next_pos <= current_pos:
-             next_pos = current_pos + 1
+            current_pos += 1
+        else:
+            current_pos = next_pos
 
-        # More robust way to set next position: ensure it's after the calculated overlap start,
-        # but also definitely after the current position to avoid infinite loops.
-        # And not beyond the end of the chunk we just processed.
-        current_pos = max(current_pos + 1, overlap_start_index)
-        # Final check to prevent getting stuck if overlap logic fails
-        if current_pos >= last_valid_end_pos and last_valid_end_pos < len(words):
-             current_pos = last_valid_end_pos # Move to the position right after the last chunk
+        # Final check: Ensure we always move forward from the start of the last chunk processed
+        # This prevents getting stuck if overlap logic leads to a non-advancing position.
+        if current_pos < last_valid_end_pos:
+             current_pos = last_valid_end_pos # Move past the chunk we just processed
+
 
     return chunks
 
@@ -433,29 +445,63 @@ def get_auth_db_contents():
         raise HTTPException(status_code=500, detail="An unexpected error occurred while retrieving user data.")
 
 
-@app.post("/register", status_code=201)
-def register_user(request: UserRegister):
-    """Registers a new user based on Supabase ID and generates an API key."""
-    if auth_db is None: # ★ Check auth_db availability
-         raise HTTPException(status_code=503, detail="Database service unavailable")
+# ★★★ /register エンドポイントの修正 ★★★
+@app.post("/register", response_model=RegisterResponse)
+def register_user(request: UserRegister, response: Response): # Inject Response object to set status code
+    """
+    Registers a new user or retrieves existing user info based on Supabase ID.
+    Returns API key, DB name, and whether the user/database already existed.
+    - Status 201 Created: New user and database created.
+    - Status 200 OK: User and database already existed, returning existing info.
+    """
+    if auth_db is None:
+        print("Error in register_user: auth_db is not available.")
+        raise HTTPException(status_code=503, detail="Database service unavailable")
+
     try:
         # Check if user already exists
+        print(f"Checking existence for supabase_user_id: {request.supabase_user_id}")
         existing_user = auth_db.users.find_one({"supabase_user_id": request.supabase_user_id})
+
         if existing_user:
-            raise HTTPException(
-                status_code=409, # Conflict
-                detail=f"User with Supabase ID '{request.supabase_user_id}' already exists."
+            # User exists, retrieve info
+            print(f"User {request.supabase_user_id} already exists. Returning existing credentials.")
+            api_key = existing_user.get("api_key")
+            db_name = existing_user.get("db_name")
+
+            # Validate retrieved data (should always exist if record is valid)
+            if not api_key or not db_name:
+                print(f"Error: Existing user {request.supabase_user_id} record in auth_db is incomplete (missing api_key or db_name).")
+                raise HTTPException(status_code=500, detail="Internal Server Error: Existing user data is inconsistent.")
+
+            # Set status code to 200 OK for existing user
+            response.status_code = 200
+            return RegisterResponse(
+                api_key=api_key,
+                db_name=db_name,
+                database_exist=True
+            )
+        else:
+            # User does not exist, create new user record and DB info
+            print(f"User {request.supabase_user_id} not found. Creating new user and database info...")
+            # MongoDBManager.create_user_db handles insertion into auth_db
+            db_info = MongoDBManager.create_user_db(request.supabase_user_id)
+
+            # Set status code to 201 Created for new user
+            response.status_code = 201
+            return RegisterResponse(
+                api_key=db_info["api_key"],
+                db_name=db_info["db_name"],
+                database_exist=False
             )
 
-        # Create user record and dedicated DB info
-        db_info = MongoDBManager.create_user_db(request.supabase_user_id)
-        return {"api_key": db_info["api_key"], "db_name": db_info["db_name"]}
     except HTTPException as e:
-         # Re-raise HTTPExceptions from create_user_db or the 409 conflict
+         # Re-raise HTTPExceptions from create_user_db or the internal validation checks
+         # Ensure status code is preserved if already set by the exception
          raise e
-    except OperationFailure as e: # Catch potential DB errors during find_one
-        print(f"Database operation error during user registration check: {e.details}")
-        raise HTTPException(status_code=500, detail=f"Database error checking user existence: {e.details}")
+    except OperationFailure as e: # Catch potential DB errors during find_one or insert_one (via create_user_db)
+        print(f"Database operation error during user registration check/creation: {e.details}")
+        raise HTTPException(status_code=500, detail=f"Database error during user registration: {e.details}")
     except Exception as e:
         print(f"Unexpected error during user registration: {type(e).__name__} - {e}")
         traceback.print_exc()
