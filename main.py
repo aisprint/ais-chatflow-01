@@ -10,7 +10,8 @@ import re # rename エンドポイントの検証用に追加
 import requests
 import PyPDF2
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends, Body, Response # Responseを追加
+# Path をインポート
+from fastapi import FastAPI, HTTPException, Header, Depends, Body, Response, Path
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, ConnectionFailure # MongoDB固有のエラー
@@ -101,13 +102,10 @@ class UserInfoResponse(BaseModel):
     db_name: str
     collections: List[str]
 
-# コレクション削除用リクエストモデル (Body用、APIキーなし)
-class DeleteCollectionBody(BaseModel):
-    collection_name: str = Field(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Name of the collection to delete")
+# ★★★ DeleteCollectionBody は不要 ★★★
 
 # コレクション名変更用リクエストモデル (Body用、APIキーなし)
 class RenameCollectionBody(BaseModel):
-    current_name: str = Field(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Current name of the collection")
     new_name: str = Field(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="New name for the collection")
 
 # 汎用レスポンスモデル
@@ -389,44 +387,16 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
                 start_time_insert = time.time(); res = collection.insert_one(doc); end_time_insert = time.time()
                 if res.inserted_id: inserted_count += 1; print(f"Chunk {i+1}/{len(chunks)} processed (embed: {end_time_embed-start_time_embed:.2f}s, insert: {end_time_insert-start_time_insert:.2f}s)")
                 else: errors.append({"chunk_index": i, "error": "Insert fail", "status_code": 500})
-
-            # ★★★ SyntaxError修正箇所 ★★★
             except HTTPException as e:
-                errors.append({
-                    "chunk_index": i,
-                    "error": e.detail,
-                    "status_code": e.status_code
-                })
+                errors.append({"chunk_index": i, "error": e.detail, "status_code": e.status_code})
                 is_critical = e.status_code in [429, 500, 502, 503]
-                if is_critical and first_error is None:
-                    first_error = e
-                    print(f"Stop: HTTP {e.status_code}")
-                    break # Exit the loop
-            # ★★★ ここまで修正 ★★★
-
+                if is_critical and first_error is None: first_error = e; print(f"Stop: HTTP {e.status_code}"); break
             except (OperationFailure, ConnectionFailure) as e:
-                error_detail = getattr(e, 'details', str(e))
-                errors.append({
-                    "chunk_index": i,
-                    "error": f"DB error: {error_detail}",
-                    "status_code": 503
-                })
-                if first_error is None:
-                    first_error = e
-                    print("Stop: DB error")
-                    break # Exit the loop
+                error_detail = getattr(e, 'details', str(e)); errors.append({"chunk_index": i, "error": f"DB error: {error_detail}", "status_code": 503})
+                if first_error is None: first_error = e; print("Stop: DB error"); break
             except Exception as e:
-                traceback.print_exc()
-                errors.append({
-                    "chunk_index": i,
-                    "error": f"Unexpected: {e}",
-                    "status_code": 500
-                })
-                if first_error is None:
-                    first_error = e
-                    print("Stop: Unexpected error")
-                    break # Exit the loop
-
+                traceback.print_exc(); errors.append({"chunk_index": i, "error": f"Unexpected: {e}", "status_code": 500})
+                if first_error is None: first_error = e; print("Stop: Unexpected error"); break
         end_time_chunks = time.time(); print(f"Chunk processing done ({end_time_chunks - start_time_chunks:.2f}s). Processed: {processed_chunks_count}, Inserted: {inserted_count}, Errors: {len(errors)}")
         # --- 6. Remove Duplicates ---
         if inserted_count > 0 and not first_error:
@@ -551,47 +521,63 @@ def get_user_collections_header_auth(request: UserCollectionsRequest, user: Dict
 
 # --- ★★★ Collection Management Endpoints (Header Auth) ★★★ ---
 
-@app.delete("/collections", response_model=ActionResponse)
+@app.delete("/collections/{collection_name}", response_model=ActionResponse)
 async def delete_collection_endpoint(
-    request: DeleteCollectionBody,        # Bodyには collection_name のみ
-    user: Dict = Depends(get_user_header) # Header (X-API-Key) で認証
+    collection_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Name of the collection to delete"),
+    user: Dict = Depends(get_user_header) # Depends は最後に
 ):
     """
-    Deletes specified collection. Requires X-API-Key header & collection_name in body.
-    WARNING: Irreversible.
+    Deletes specified collection identified by path parameter.
+    Requires X-API-Key header. WARNING: Irreversible.
     """
-    collection_name = request.collection_name
     print(f"Request delete coll '{collection_name}' for user {user.get('supabase_user_id')}")
     try:
         db = MongoDBManager.get_user_db(user); db_name = db.name
-        if collection_name not in db.list_collection_names(): raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found.")
+        if collection_name not in db.list_collection_names():
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found.")
+
         print(f"Dropping coll '{collection_name}' in db '{db_name}'...")
         db.drop_collection(collection_name)
         print(f"Drop initiated for '{collection_name}'.")
         return ActionResponse(status="success", message=f"Collection '{collection_name}' deleted.")
-    except OperationFailure as e: print(f"DB delete error: {e.details}"); raise HTTPException(status_code=500, detail=f"DB delete fail: {e.details}")
-    except ConnectionFailure as e: print(f"DB conn fail delete: {e}"); raise HTTPException(status_code=503, detail=f"DB conn lost delete.")
+    except OperationFailure as e:
+        print(f"DB delete error: {e.details}")
+        raise HTTPException(status_code=500, detail=f"DB delete fail: {e.details}")
+    except ConnectionFailure as e:
+        print(f"DB conn fail delete: {e}")
+        raise HTTPException(status_code=503, detail=f"DB conn lost delete.")
     except HTTPException as e: raise e
-    except Exception as e: print(f"Unexpected delete err: {type(e).__name__}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected delete error: {e}")
+    except Exception as e:
+        print(f"Unexpected delete err: {type(e).__name__}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected delete error: {e}")
 
-@app.put("/collections", response_model=ActionResponse)
+@app.put("/collections/{current_name}", response_model=ActionResponse)
 async def rename_collection_endpoint(
-    request: RenameCollectionBody,        # Bodyには current_name, new_name のみ
-    user: Dict = Depends(get_user_header) # Header (X-API-Key) で認証
+    # ★★★ パラメータの順序修正 ★★★
+    current_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Current name of the collection"),
+    request: RenameCollectionBody = Body(...), # Body(...) を明示
+    user: Dict = Depends(get_user_header)      # Depends は最後に
 ):
     """
-    Renames specified collection. Requires X-API-Key header & names in body.
+    Renames specified collection identified by path parameter. Requires X-API-Key header & new_name in body.
     Note: Atlas Search indexes need manual recreation.
     """
-    current_name = request.current_name; new_name = request.new_name
+    new_name = request.new_name
     print(f"Request rename '{current_name}' to '{new_name}' for user {user.get('supabase_user_id')}")
-    if current_name == new_name: raise HTTPException(status_code=400, detail="New name same as current.")
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", new_name): raise HTTPException(status_code=400, detail="Invalid chars in new name.")
+
+    if current_name == new_name:
+        raise HTTPException(status_code=400, detail="New name same as current.")
+    # new_name validation by Pydantic model
+
     try:
         db = MongoDBManager.get_user_db(user); db_name = db.name
         coll_names = db.list_collection_names()
-        if current_name not in coll_names: raise HTTPException(status_code=404, detail=f"Source coll '{current_name}' not found.")
-        if new_name in coll_names: raise HTTPException(status_code=409, detail=f"Target coll '{new_name}' exists.")
+        if current_name not in coll_names:
+            raise HTTPException(status_code=404, detail=f"Source collection '{current_name}' not found.")
+        if new_name in coll_names:
+            raise HTTPException(status_code=409, detail=f"Target collection name '{new_name}' already exists.")
+
         print(f"Renaming '{current_name}' to '{new_name}' in db '{db_name}'...")
         try:
             if mongo_client is None: raise HTTPException(status_code=503, detail="DB client unavailable for rename.")
