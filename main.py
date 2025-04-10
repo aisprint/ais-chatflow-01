@@ -337,110 +337,473 @@ def create_collection_endpoint(request: CollectionCreate, user: Dict = Depends(g
 @app.post("/process")
 async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_header)):
     """Downloads, processes PDF, stores embeddings. Requires X-API-Key header."""
-    index_name = "vector_index"; index_status = "not_checked"; first_error = None
-    duplicates_removed_count = 0; inserted_count = 0; processed_chunks_count = 0; errors = []
+    index_name = "vector_index" # ★ インデックス名を定義
+    index_status = "not_checked" # ★ 初期ステータス
+    first_error = None
+    duplicates_removed_count = 0
+    inserted_count = 0
+    processed_chunks_count = 0
+    errors = []
     start_time_total = time.time()
-    print(f"Process PDF for {user.get('supabase_user_id', 'N/A')}: {request.pdf_url}")
+    print(f"Process PDF request for user {user.get('supabase_user_id', 'N/A')}: URL={request.pdf_url}, Collection='{request.collection_name}'")
+
     try:
         # --- 1. Download PDF ---
         try:
             start_time_download = time.time()
-            response = await asyncio.to_thread(requests.get, str(request.pdf_url), timeout=60); response.raise_for_status()
-            end_time_download = time.time(); print(f"PDF downloaded ({end_time_download - start_time_download:.2f}s).")
-            content_length = response.headers.get('Content-Length'); pdf_bytes = response.content; pdf_size = len(pdf_bytes)
-            if pdf_size > MAX_FILE_SIZE: raise HTTPException(status_code=413, detail=f"PDF size ({pdf_size/(1024*1024):.2f}MB) > limit ({MAX_FILE_SIZE/(1024*1024)}MB).")
-            pdf_content = io.BytesIO(pdf_bytes); size_source = f"header: {content_length}" if content_length else "checked post-download"
-            print(f"PDF size: {pdf_size/(1024*1024):.2f} MB ({size_source}).")
-        except requests.exceptions.Timeout: raise HTTPException(status_code=408, detail="PDF download timeout.")
-        except requests.exceptions.SSLError as ssl_err: raise HTTPException(status_code=502, detail=f"SSL error: {ssl_err}.")
+            # Use asyncio.to_thread for blocking requests call
+            response = await asyncio.to_thread(requests.get, str(request.pdf_url), timeout=60)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            end_time_download = time.time()
+            print(f"PDF downloaded successfully ({end_time_download - start_time_download:.2f}s).")
+
+            content_length = response.headers.get('Content-Length')
+            pdf_bytes = response.content
+            pdf_size = len(pdf_bytes)
+
+            if pdf_size > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail=f"PDF file size ({pdf_size / (1024 * 1024):.2f}MB) exceeds the maximum limit ({MAX_FILE_SIZE / (1024 * 1024)}MB).")
+
+            pdf_content = io.BytesIO(pdf_bytes)
+            size_source = f"Content-Length header: {content_length}" if content_length else "checked post-download"
+            print(f"PDF size: {pdf_size / (1024 * 1024):.2f} MB ({size_source}).")
+
+        except requests.exceptions.Timeout:
+            raise HTTPException(status_code=408, detail="Request timed out while downloading the PDF.")
+        except requests.exceptions.SSLError as ssl_err:
+             # Provide more context for SSL errors if possible
+             raise HTTPException(status_code=502, detail=f"SSL error occurred during PDF download: {ssl_err}. Check the server's SSL certificate or network configuration.")
         except requests.exceptions.RequestException as req_error:
-             status_code = 502 if isinstance(req_error, requests.exceptions.ConnectionError) else 400
-             detail = f"PDF download fail: {req_error}" + (f" (Status: {req_error.response.status_code})" if hasattr(req_error, 'response') and req_error.response else "")
+             status_code = 502 if isinstance(req_error, (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError)) else 400
+             detail = f"Failed to download PDF from URL: {req_error}"
+             if hasattr(req_error, 'response') and req_error.response is not None:
+                 detail += f" (Status Code: {req_error.response.status_code})"
+             print(f"PDF download failed: {detail}")
              raise HTTPException(status_code=status_code, detail=detail)
+
         # --- 2. Extract text ---
         try:
             start_time_extract = time.time()
+            # Use asyncio.to_thread for blocking PyPDF2 call
             def extract_text_sync(pdf_stream):
-                 reader = PyPDF2.PdfReader(pdf_stream);
-                 if reader.is_encrypted: raise ValueError("Encrypted PDF unsupported.")
-                 return "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
-            text = await asyncio.to_thread(extract_text_sync, pdf_content); end_time_extract = time.time()
-            if not text.strip(): return JSONResponse(content={"status": "success", "message": "No text.", "chunks_processed": 0, "chunks_inserted": 0, "duplicates_removed": 0, "vector_index_name": index_name, "vector_index_status": "skipped_no_text", "processing_time_seconds": round(time.time() - start_time_total, 2)}, status_code=200)
-            print(f"Text extracted ({len(text)} chars, {end_time_extract - start_time_extract:.2f}s).")
-        except PyPDF2.errors.PdfReadError as e: raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
-        except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e: traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Text extract fail: {e}")
+                 try:
+                     reader = PyPDF2.PdfReader(pdf_stream)
+                     if reader.is_encrypted:
+                         # PyPDF2 can sometimes handle basic password-protected PDFs if password provided,
+                         # but generally, encrypted PDFs are problematic.
+                         # Consider adding password handling if needed, otherwise raise error.
+                         raise ValueError("Processing encrypted PDFs is not supported.")
+                     full_text = ""
+                     for page in reader.pages:
+                         page_text = page.extract_text()
+                         if page_text: # Add text only if extraction was successful for the page
+                             full_text += page_text + "\n" # Add newline between pages
+                     return full_text
+                 except PyPDF2.errors.PdfReadError as pdf_err:
+                     # Catch specific PyPDF2 read errors
+                     raise ValueError(f"Invalid or corrupted PDF file: {pdf_err}") from pdf_err
+                 except Exception as inner_e:
+                     # Catch other potential errors during extraction
+                     raise RuntimeError(f"Error during text extraction: {inner_e}") from inner_e
+
+            text = await asyncio.to_thread(extract_text_sync, pdf_content)
+            end_time_extract = time.time()
+
+            if not text or text.isspace():
+                print("No text could be extracted from the PDF or the PDF was empty.")
+                # Return success but indicate no processing occurred
+                return JSONResponse(
+                    content={
+                        "status": "success",
+                        "message": "PDF processed, but no text was extracted.",
+                        "chunks_processed": 0,
+                        "chunks_inserted": 0,
+                        "duplicates_removed": 0,
+                        "vector_index_name": index_name,
+                        "vector_index_status": "skipped_no_text",
+                        "processing_time_seconds": round(time.time() - start_time_total, 2)
+                    },
+                    status_code=200
+                )
+            print(f"Text extracted successfully ({len(text)} characters, {end_time_extract - start_time_extract:.2f}s).")
+
+        except ValueError as e: # Catch specific errors like encryption or invalid PDF
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e: # Catch other extraction errors
+             print(f"Text extraction runtime error: {e}")
+             traceback.print_exc()
+             raise HTTPException(status_code=500, detail=f"Failed during text extraction phase: {e}")
+        except Exception as e: # Catch any other unexpected errors
+            print(f"Unexpected error during text extraction setup: {type(e).__name__} - {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred during text extraction: {e}")
+
         # --- 3. Split text ---
-        start_time_split = time.time(); chunks = split_text_into_chunks(text); end_time_split = time.time()
-        print(f"Split {len(chunks)} chunks ({end_time_split - start_time_split:.2f}s).")
-        if not chunks: return JSONResponse(content={"status": "success", "message": "No chunks.", "chunks_processed": 0, "chunks_inserted": 0, "duplicates_removed": 0, "vector_index_name": index_name, "vector_index_status": "skipped_no_chunks", "processing_time_seconds": round(time.time() - start_time_total, 2)}, status_code=200)
+        start_time_split = time.time()
+        chunks = split_text_into_chunks(text, chunk_size=1500, overlap=100) # Use defined function
+        end_time_split = time.time()
+        print(f"Text split into {len(chunks)} chunks ({end_time_split - start_time_split:.2f}s).")
+
+        if not chunks:
+            print("Text extracted but resulted in zero chunks after splitting.")
+            # Return success but indicate no chunks to process
+            return JSONResponse(
+                content={
+                    "status": "success",
+                    "message": "PDF processed and text extracted, but no processable chunks were generated.",
+                    "chunks_processed": 0,
+                    "chunks_inserted": 0,
+                    "duplicates_removed": 0,
+                    "vector_index_name": index_name,
+                    "vector_index_status": "skipped_no_chunks",
+                    "processing_time_seconds": round(time.time() - start_time_total, 2)
+                },
+                status_code=200
+            )
+
         # --- 4. DB Setup ---
-        db = MongoDBManager.get_user_db(user); collection = MongoDBManager.create_collection(db, request.collection_name, user["supabase_user_id"])
-        # --- 5. Process Chunks ---
-        start_time_chunks = time.time(); print(f"Processing {len(chunks)} chunks...")
+        db = MongoDBManager.get_user_db(user)
+        collection = MongoDBManager.create_collection(db, request.collection_name, user["supabase_user_id"])
+        print(f"Using database '{db.name}' and collection '{collection.name}'.")
+
+        # --- 5. Process Chunks (Embedding and Insertion) ---
+        start_time_chunks = time.time()
+        print(f"Starting processing for {len(chunks)} text chunks...")
+
+        # Process chunks concurrently using asyncio.gather (optional, adds complexity)
+        # Or process sequentially as shown below:
         for i, chunk in enumerate(chunks):
-            if not chunk or chunk.isspace(): continue; processed_chunks_count += 1
+            # Basic check to skip empty or whitespace-only chunks
+            if not chunk or chunk.isspace():
+                print(f"Skipping empty chunk at index {i}.")
+                continue
+
+            processed_chunks_count += 1 # Count chunks attempted for processing
+
             try:
-                start_time_embed = time.time(); embedding = await asyncio.to_thread(get_openai_embedding, chunk); end_time_embed = time.time()
-                if not embedding: errors.append({"chunk_index": i, "error": "Empty embedding", "status_code": 400}); continue
-                doc = {"text": chunk, "embedding": embedding, "metadata": {**request.metadata, "chunk_index": i, "original_url": str(request.pdf_url), "processed_at": datetime.utcnow()}, "created_at": datetime.utcnow()}
-                start_time_insert = time.time(); res = collection.insert_one(doc); end_time_insert = time.time()
-                if res.inserted_id: inserted_count += 1; print(f"Chunk {i+1}/{len(chunks)} processed (embed: {end_time_embed-start_time_embed:.2f}s, insert: {end_time_insert-start_time_insert:.2f}s)")
-                else: errors.append({"chunk_index": i, "error": "Insert fail", "status_code": 500})
+                # --- Get Embedding ---
+                start_time_embed = time.time()
+                # Use asyncio.to_thread for blocking OpenAI call
+                embedding = await asyncio.to_thread(get_openai_embedding, chunk)
+                end_time_embed = time.time()
+
+                if not embedding:
+                    # Should not happen if get_openai_embedding raises HTTPException on failure, but as a safeguard:
+                    print(f"Warning: Skipping chunk {i+1}/{len(chunks)} due to empty embedding result.")
+                    errors.append({"chunk_index": i, "error": "Received empty embedding without error", "status_code": 500})
+                    continue # Skip this chunk
+
+                # --- Prepare Document ---
+                doc = {
+                    "text": chunk,
+                    "embedding": embedding,
+                    "metadata": {
+                        **request.metadata, # User-provided metadata
+                        "chunk_index": i,
+                        "original_url": str(request.pdf_url), # Store original URL
+                        "processed_at": datetime.utcnow()
+                    },
+                    "created_at": datetime.utcnow() # Record creation time
+                }
+
+                # --- Insert Document ---
+                start_time_insert = time.time()
+                insert_result = collection.insert_one(doc)
+                end_time_insert = time.time()
+
+                if insert_result.inserted_id:
+                    inserted_count += 1
+                    # Log progress periodically or for each chunk if needed
+                    if (i + 1) % 10 == 0 or (i + 1) == len(chunks): # Log every 10 chunks and the last one
+                         print(f"Processed chunk {i+1}/{len(chunks)} (Embed: {end_time_embed-start_time_embed:.2f}s, Insert: {end_time_insert-start_time_insert:.2f}s)")
+                else:
+                    # This case is unlikely with insert_one unless an error is missed
+                    print(f"Warning: Chunk {i+1}/{len(chunks)} insertion did not return an ID.")
+                    errors.append({"chunk_index": i, "error": "MongoDB insert_one did not return an inserted_id", "status_code": 500})
+
             except HTTPException as e:
+                # Handle errors from get_openai_embedding (e.g., OpenAI API errors, rate limits)
+                print(f"Error processing chunk {i+1}/{len(chunks)}: HTTP {e.status_code} - {e.detail}")
                 errors.append({"chunk_index": i, "error": e.detail, "status_code": e.status_code})
-                is_critical = e.status_code in [429, 500, 502, 503]
-                if is_critical and first_error is None: first_error = e; print(f"Stop: HTTP {e.status_code}"); break
-            except (OperationFailure, ConnectionFailure) as e:
-                error_detail = getattr(e, 'details', str(e)); errors.append({"chunk_index": i, "error": f"DB error: {error_detail}", "status_code": 503})
-                if first_error is None: first_error = e; print("Stop: DB error"); break
+                # Decide if the error is critical enough to stop processing
+                is_critical_error = e.status_code in [401, 403, 429, 500, 502, 503] # Example critical errors
+                if is_critical_error and first_error is None:
+                    print(f"Stopping processing due to critical error: {e.status_code}")
+                    first_error = e # Store the first critical error encountered
+                    break # Stop processing further chunks
+
+            except (OperationFailure, ConnectionFailure) as db_error:
+                # Handle MongoDB specific errors during insertion
+                error_detail = getattr(db_error, 'details', str(db_error))
+                print(f"Database error processing chunk {i+1}/{len(chunks)}: {type(db_error).__name__} - {error_detail}")
+                errors.append({"chunk_index": i, "error": f"Database operation/connection failed: {error_detail}", "status_code": 503})
+                if first_error is None:
+                    print("Stopping processing due to critical database error.")
+                    first_error = db_error
+                    break # Stop processing further chunks
+
             except Exception as e:
-                traceback.print_exc(); errors.append({"chunk_index": i, "error": f"Unexpected: {e}", "status_code": 500})
-                if first_error is None: first_error = e; print("Stop: Unexpected error"); break
-        end_time_chunks = time.time(); print(f"Chunk processing done ({end_time_chunks - start_time_chunks:.2f}s). Processed: {processed_chunks_count}, Inserted: {inserted_count}, Errors: {len(errors)}")
-        # --- 6. Remove Duplicates ---
+                # Handle any other unexpected errors during chunk processing
+                print(f"Unexpected error processing chunk {i+1}/{len(chunks)}: {type(e).__name__} - {e}")
+                traceback.print_exc()
+                errors.append({"chunk_index": i, "error": f"Unexpected error: {str(e)}", "status_code": 500})
+                if first_error is None:
+                    print("Stopping processing due to unexpected critical error.")
+                    first_error = e
+                    break # Stop processing further chunks
+
+        end_time_chunks = time.time()
+        print(f"Finished chunk processing ({end_time_chunks - start_time_chunks:.2f}s). "
+              f"Attempted: {processed_chunks_count}, Inserted: {inserted_count}, Errors: {len(errors)}")
+
+        # --- 6. Remove Duplicates (based on text content and URL) ---
+        # Run deduplication only if new chunks were inserted and no critical error stopped processing early
         if inserted_count > 0 and not first_error:
-            start_time_dedup = time.time(); print(f"Checking duplicates for {request.pdf_url}...")
+            start_time_dedup = time.time()
+            print(f"Starting duplicate check for documents from URL: {request.pdf_url}...")
+            duplicates_removed_count = 0 # Initialize counter
             try:
-                pipeline = [{"$match": {"metadata.original_url": str(request.pdf_url)}},{"$group": {"_id": "$text", "ids": {"$push": "$_id"}, "count": {"$sum": 1}}},{"$match": {"count": {"$gt": 1}}}]
-                ids_to_delete = [oid for group in collection.aggregate(pipeline) for oid in group['ids'][1:]]
-                if ids_to_delete: res = collection.delete_many({"_id": {"$in": ids_to_delete}}); duplicates_removed_count = res.deleted_count; print(f"Deleted {duplicates_removed_count} duplicates.")
-                else: print("No duplicates.")
-                print(f"Deduplication done ({time.time() - start_time_dedup:.2f}s).")
-            except Exception as e: print(f"Deduplication error: {e}"); index_status = "duplicates_check_failed"
-        elif first_error: index_status = "duplicates_skipped_error"; print("Skip duplicate removal (errors).")
-        else: index_status = "duplicates_skipped_no_inserts"; print("Skip duplicate removal (no inserts).")
-        # --- 7. Manage Vector Index ---
+                # Pipeline to find duplicate text within the same URL context
+                pipeline = [
+                    {"$match": {"metadata.original_url": str(request.pdf_url)}}, # Filter by URL
+                    {"$group": {
+                        "_id": "$text",  # Group by the text content
+                        "ids": {"$push": "$_id"}, # Collect all document IDs for this text
+                        "count": {"$sum": 1}     # Count occurrences
+                    }},
+                    {"$match": {"count": {"$gt": 1}}} # Filter groups with more than one document (duplicates)
+                ]
+                duplicate_groups = list(collection.aggregate(pipeline))
+
+                ids_to_delete = []
+                for group in duplicate_groups:
+                    # Keep the first ID, mark the rest for deletion
+                    ids_to_delete.extend(group['ids'][1:])
+
+                if ids_to_delete:
+                    print(f"Found {len(ids_to_delete)} duplicate document(s) to remove.")
+                    delete_result = collection.delete_many({"_id": {"$in": ids_to_delete}})
+                    duplicates_removed_count = delete_result.deleted_count
+                    print(f"Successfully removed {duplicates_removed_count} duplicate document(s).")
+                else:
+                    print("No duplicate documents found for this URL.")
+
+                print(f"Duplicate check and removal finished ({time.time() - start_time_dedup:.2f}s).")
+                index_status = "duplicates_checked" # Indicate check was performed
+
+            except (OperationFailure, ConnectionFailure) as db_error:
+                 print(f"Database error during duplicate removal: {type(db_error).__name__} - {getattr(db_error, 'details', str(db_error))}")
+                 index_status = "duplicates_check_failed_db_error"
+            except Exception as e:
+                 print(f"Unexpected error during duplicate removal: {type(e).__name__} - {e}")
+                 traceback.print_exc()
+                 index_status = "duplicates_check_failed_unexpected"
+        elif first_error:
+            index_status = "duplicates_skipped_due_to_error"
+            print("Skipping duplicate removal because processing stopped due to an error.")
+        else: # inserted_count == 0
+            index_status = "duplicates_skipped_no_inserts"
+            print("Skipping duplicate removal as no new documents were inserted.")
+
+
+        # --- ★ 7. Manage Vector Search Index (Based on previous successful logic) ---
         data_changed = inserted_count > 0 or duplicates_removed_count > 0
+        # Only manage index if data changed and no critical errors occurred during processing
         if data_changed and not first_error:
-            attempt_creation, index_dropped = True, False; print(f"Data changed. Manage index '{index_name}'...")
+            attempt_creation = True # Flag to control creation attempt
+            index_dropped = False   # Flag to track if index was dropped
             start_time_index = time.time()
+            print(f"Data has changed (Inserted: {inserted_count}, Duplicates Removed: {duplicates_removed_count}). Managing vector search index '{index_name}'...")
+
             try:
-                if list(collection.list_search_indexes(index_name)):
-                    print(f"Index '{index_name}' exists. Dropping...");
-                    try: collection.drop_search_index(index_name); wait = 20; print(f"Wait {wait}s..."); await asyncio.sleep(wait); index_dropped = True; print("Drop ok.")
-                    except Exception as e: print(f"Index drop error: {e}"); index_status = f"failed_drop:{getattr(e,'codeName','')}"; attempt_creation = False
+                # 7a. Check for existing index (using list_search_indexes and filtering in Python)
+                print(f"Checking for existing vector search index named '{index_name}'...")
+                # Fetch all search indexes for the collection
+                existing_indexes = list(collection.list_search_indexes())
+                index_exists = any(idx.get('name') == index_name for idx in existing_indexes)
+
+                # 7b. Drop index if it exists
+                if index_exists:
+                    print(f"Index '{index_name}' found. Attempting to drop it...")
+                    try:
+                        collection.drop_search_index(index_name)
+                        wait_time = 20 # Seconds to wait for drop operation to propagate (adjust if needed)
+                        print(f"Successfully initiated drop for index '{index_name}'. Waiting {wait_time}s for propagation...")
+                        await asyncio.sleep(wait_time) # Use asyncio.sleep in async context
+                        index_dropped = True
+                        print("Proceeding to create new index after waiting.")
+                    except OperationFailure as drop_err:
+                        code_name = getattr(drop_err, 'codeName', 'UnknownCode')
+                        print(f"MongoDB Operation Failure dropping index '{index_name}': CodeName={code_name}, Details={drop_err.details}")
+                        index_status = f"failed_drop_operation_{code_name}"
+                        attempt_creation = False # Do not attempt creation if drop failed
+                    except Exception as drop_err:
+                        print(f"Unexpected error dropping index '{index_name}': {type(drop_err).__name__} - {drop_err}")
+                        traceback.print_exc()
+                        index_status = f"failed_drop_unexpected"
+                        attempt_creation = False # Do not attempt creation if drop failed unexpectedly
+                else:
+                    print(f"Index '{index_name}' not found. Will create a new one.")
+
+                # 7c. Create the index if conditions allow
                 if attempt_creation:
-                    print(f"Creating index '{index_name}'..."); dims = 1536; index_def = {"mappings": {"dynamic": False, "fields": {"embedding": {"type": "knnVector", "dimensions": dims, "similarity": "cosine"}, "text": {"type": "string", "analyzer": "lucene.standard"}}}}
-                    try: collection.create_search_index({"name": index_name, "definition": index_def}); index_status = f"{'re' if index_dropped else ''}created"; print(f"Index creation initiated.")
-                    except Exception as e: print(f"Index create error: {e}"); index_status = f"failed_create:{getattr(e,'codeName','')}"
-            except Exception as e: print(f"Index mgmt setup error: {e}"); 
-            if index_status == "not_checked": index_status = f"failed_mgmt_setup"
-            print(f"Index management done ({time.time() - start_time_index:.2f}s). Status: {index_status}")
-        elif first_error: index_status = "skipped_processing_error"; print(f"Skip index management (error: {type(first_error).__name__})")
-        else: index_status = "skipped_no_data_change"; print("Skip index management (no data change).")
-        # --- 8. Return Response ---
-        processing_time = round(time.time() - start_time_total, 2); final_status_code = 200; msg = "Processed successfully."
+                    print(f"Attempting to create vector search index '{index_name}'...")
+                    # Define the index structure (ensure dimensions match your embedding model)
+                    index_definition = {
+                        "mappings": {
+                            "dynamic": False, # Explicitly define fields to index
+                            "fields": {
+                                "embedding": {
+                                    "type": "knnVector",
+                                    "dimensions": 1536, # For OpenAI text-embedding-ada-002
+                                    "similarity": "cosine" # Or "euclidean" / "dotProduct"
+                                },
+                                "text": { # For hybrid search ($search stage)
+                                    "type": "string",
+                                    "analyzer": "lucene.standard" # Standard analyzer
+                                    # Consider "lucene.kuromoji" for Japanese, etc.
+                                }
+                                # Add metadata fields here if they need to be searchable via $search
+                                # "metadata.field_name": { "type": "string" }
+                            }
+                        }
+                    }
+                    # Use the 'model' parameter format as in the previous successful code
+                    search_index_model = {"name": index_name, "definition": index_definition}
+                    try:
+                        collection.create_search_index(model=search_index_model)
+                        # Set status based on whether it was created or recreated
+                        index_status = f"{'re' if index_dropped else ''}created"
+                        print(f"Index creation {'initiated' if not index_dropped else 're-initiated'} for '{index_name}'. It may take some time for the index to become fully queryable.")
+                    except OperationFailure as create_err:
+                        code_name = getattr(create_err, 'codeName', 'UnknownCode')
+                        print(f"MongoDB Operation Failure creating index '{index_name}': CodeName={code_name}, Details={create_err.details}")
+                        index_status = f"failed_create_operation_{code_name}"
+                    except Exception as create_err:
+                        print(f"Unexpected error creating index '{index_name}': {type(create_err).__name__} - {create_err}")
+                        traceback.print_exc()
+                        index_status = f"failed_create_unexpected"
+
+                # Handle case where creation was skipped due to drop failure
+                elif not attempt_creation and index_status.startswith("failed_drop"):
+                    print(f"Index creation skipped because the drop operation failed. Final index status: {index_status}")
+                else: # Should not happen unless logic error
+                     print(f"WARN: Index creation was not attempted for an unexpected reason. Status: {index_status}")
+                     if index_status == "not_checked": index_status = "skipped_unknown_reason"
+
+
+            except OperationFailure as list_err:
+                 # Handle errors during list_search_indexes
+                 code_name = getattr(list_err, 'codeName', 'UnknownCode')
+                 print(f"MongoDB Operation Failure listing search indexes: CodeName={code_name}, Details={list_err.details}")
+                 index_status = f"failed_list_indexes_{code_name}"
+            except ConnectionFailure as conn_err:
+                 # Handle connection errors during index management
+                 print(f"MongoDB Connection Failure during index management: {conn_err}")
+                 index_status = "failed_connection_during_index_mgmt"
+            except Exception as outer_idx_err:
+                # Catch any other errors during the index management setup phase
+                print(f"Error during index management setup phase: {type(outer_idx_err).__name__} - {outer_idx_err}")
+                traceback.print_exc()
+                # Ensure index_status reflects this failure if not already set
+                if index_status == "not_checked" or index_status == "duplicates_checked": # If status hasn't recorded an index op failure yet
+                    index_status = f"failed_management_setup"
+
+            # Final check for status (should always be set by now)
+            if index_status == "not_checked" or index_status == "duplicates_checked":
+                 index_status = "status_logic_error" # Should not happen
+                 print(f"WARN: Index status logic might have an issue. Final status: {index_status}")
+
+            print(f"Index management finished ({time.time() - start_time_index:.2f}s). Final Status: {index_status}")
+
+        # --- Handle cases where index management was skipped ---
+        elif first_error:
+            index_status = "skipped_due_to_processing_error"
+            print(f"Skipping index management due to critical error during chunk processing (Error: {type(first_error).__name__}).")
+        else: # data_changed is False (no inserts or removals)
+            index_status = "skipped_no_data_change"
+            print("Skipping index management as no data was inserted or removed.")
+
+
+        # --- 8. Return Response (Adjusted based on previous logic and current context) ---
+        processing_time = round(time.time() - start_time_total, 2)
+        final_status_code = 200 # Default to success
+        response_status = "success"
+        message = "PDF processed successfully."
+
         if errors:
-            if inserted_count > 0: final_status_code = 207; msg = f"Processed with {len(errors)} errors/{processed_chunks_count} chunks."
-            else: final_status_code = 400; msg = f"Processing failed ({len(errors)} errors/{processed_chunks_count} chunks)."
-            if first_error and hasattr(first_error, 'status_code') and first_error.status_code in [429, 500, 502, 503]: final_status_code = first_error.status_code
-            elif first_error and isinstance(first_error, (OperationFailure, ConnectionFailure)): final_status_code = 503
-        resp_body = {"status": "success" if final_status_code == 200 else ("partial_success" if final_status_code == 207 else "failed"), "message": msg, "chunks_processed": processed_chunks_count, "chunks_inserted": inserted_count, "duplicates_removed": duplicates_removed_count, "vector_index_name": index_name, "vector_index_status": index_status, "processing_time_seconds": processing_time, }
-        if errors: resp_body["errors_sample"] = errors[:10]
-        return JSONResponse(content=resp_body, status_code=final_status_code)
-    except HTTPException as e: raise e
-    except Exception as e: traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected processing error: {e}")
+            # If there were errors, adjust status and message
+            if inserted_count > 0:
+                # Partial success if some chunks were inserted despite errors
+                final_status_code = 207 # Partial Content
+                response_status = "partial_success"
+                message = f"Processed {processed_chunks_count} chunks with {len(errors)} errors. {inserted_count} chunks inserted."
+            else:
+                # Failed if errors occurred and no chunks were inserted
+                # Determine if it's a client error (4xx) or server error (5xx) based on first critical error
+                if first_error and isinstance(first_error, HTTPException) and 400 <= first_error.status_code < 500:
+                     final_status_code = first_error.status_code
+                elif first_error: # Includes DB errors or 5xx HTTP errors or unexpected errors
+                    final_status_code = 500 # Or maybe 503 for DB? Let's use 500 generally here.
+                else: # Errors occurred but no single critical one identified to stop early? Default to 400.
+                    final_status_code = 400 # Bad Request assumed if processing failed without inserts
+                response_status = "failed"
+                message = f"Processing failed with {len(errors)} errors. No chunks were inserted."
+
+            # If a critical error forced processing to stop, ensure the status code reflects it
+            if first_error:
+                 critical_error_message = f" Processing stopped early due to critical error: {type(first_error).__name__}."
+                 if isinstance(first_error, HTTPException):
+                     if first_error.status_code >= 500: final_status_code = first_error.status_code # Prioritize 5xx
+                     elif first_error.status_code == 429: final_status_code = 429 # Prioritize 429
+                     elif final_status_code < 400: final_status_code = first_error.status_code # Use 4xx if not already error
+                     critical_error_message += f" (HTTP {first_error.status_code}: {first_error.detail})"
+                 elif isinstance(first_error, (OperationFailure, ConnectionFailure)):
+                     final_status_code = 503 # Service Unavailable for DB errors
+                     critical_error_message += f" (DB Error: {getattr(first_error, 'details', str(first_error))})"
+                 else: # Unexpected error
+                     if final_status_code < 500: final_status_code = 500 # Ensure it's a server error
+                     critical_error_message += f" (Error: {str(first_error)})"
+                 message += critical_error_message
+                 # Update response_status based on final code
+                 if final_status_code >= 500 or final_status_code == 429: response_status = "failed"
+                 elif final_status_code == 207: response_status = "partial_success"
+                 elif final_status_code >= 400: response_status = "failed" # e.g. 400, 401, 403, 413
+
+
+        response_body = {
+            "status": response_status,
+            "message": message,
+            "chunks_processed": processed_chunks_count, # How many chunks were *attempted*
+            "chunks_inserted": inserted_count,        # How many *successfully* inserted
+            "duplicates_removed": duplicates_removed_count,
+            "vector_index_name": index_name,
+            "vector_index_status": index_status, # The detailed status from step 7
+            "processing_time_seconds": processing_time,
+        }
+        # Include a sample of errors if any occurred
+        if errors:
+            response_body["errors_sample"] = [
+                {
+                    "chunk_index": e.get("chunk_index", "N/A"),
+                    "status_code": e.get("status_code", 500),
+                    "error": str(e.get("error", "Unknown error")) # Ensure error is string
+                 }
+                 for e in errors[:10] # Limit sample size
+            ]
+
+        print(f"Responding with status code {final_status_code}. Index status: {index_status}")
+        return JSONResponse(content=response_body, status_code=final_status_code)
+
+    except HTTPException as http_exc:
+        # Re-raise HTTPExceptions raised intentionally in the process
+        print(f"Caught HTTPException: Status={http_exc.status_code}, Detail={http_exc.detail}")
+        raise http_exc
+    except Exception as e:
+        # Catch-all for any other unexpected errors in the main try block
+        print(f"Unexpected top-level error in '/process' endpoint: {type(e).__name__}: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred during PDF processing: {str(e)}")
 
 # /search uses Header auth
 @app.post("/search", response_model=SearchResponse)
