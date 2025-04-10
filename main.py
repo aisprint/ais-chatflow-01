@@ -145,6 +145,23 @@ class VectorSearchResponse(BaseModel):
 class SearchResponse(BaseModel):
     results: List[SearchResultItem]
 
+# Get collection stats
+class CollectionStats(BaseModel):
+    ns: str = Field(..., description="Namespace (database.collection)")
+    count: int = Field(..., description="Total number of documents (chunks) in the collection")
+    size: int = Field(..., description="Total size of the documents in bytes (excluding indexes)")
+    avgObjSize: Optional[float] = Field(None, description="Average document size in bytes") # collStats might not always return this precise field name depending on version/setup
+    storageSize: int = Field(..., description="Total size allocated for the collection on disk in bytes")
+    nindexes: int = Field(..., description="Number of indexes on the collection")
+    totalIndexSize: int = Field(..., description="Total size of all indexes in bytes")
+    # Add other fields from collStats if needed, like 'capped', 'max', etc.
+
+class CollectionStatsResponse(BaseModel):
+    collection_name: str
+    stats: CollectionStats
+    distinct_source_urls_count: Optional[int] = Field(None, description="Number of distinct source PDF URLs processed into this collection. Can be null if check fails or no metadata found.")
+    message: Optional[str] = None
+
 # --- Dependencies ---
 def verify_admin(api_key: str = Header(..., alias="X-API-Key")):
     """Verifies the admin API key provided in the header."""
@@ -1292,6 +1309,102 @@ async def rename_collection_endpoint(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during collection rename: {e}")
 
+# Get collection stats
+@app.get("/collections/{collection_name}/stats", response_model=CollectionStatsResponse)
+def get_collection_stats(
+    collection_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Name of the collection to get stats for"),
+    user: Dict = Depends(get_user_header) # User authentication
+):
+    """
+    Retrieves statistics for a specified collection in the user's database,
+    including document count, size, index information, and optionally the count
+    of distinct source URLs. Requires X-API-Key header.
+    """
+    print(f"Request for stats of collection '{collection_name}' for user {user.get('supabase_user_id')}")
+    distinct_urls_count = None
+    stats_message = None
+
+    try:
+        db = MongoDBManager.get_user_db(user)
+        db_name = db.name
+
+        # 1. Check if collection exists
+        try:
+            collection_names = db.list_collection_names()
+            if collection_name not in collection_names:
+                raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found in database '{db_name}'.")
+        except (OperationFailure, ConnectionFailure) as e:
+            print(f"DB error listing collections for stats check: {e}")
+            raise HTTPException(status_code=503, detail=f"Database error checking collection existence: {getattr(e, 'details', str(e))}")
+
+        collection = db[collection_name] # Get collection object
+
+        # 2. Get Collection Statistics using collStats command
+        print(f"Fetching collStats for '{db_name}.{collection_name}'...")
+        try:
+            # Use db.command for administrative commands
+            # Note: Requires appropriate permissions for the user/API key
+            coll_stats_raw = db.command('collStats', collection_name)
+            # Ensure required fields are present, adapt field names if necessary (e.g., avgObjSize might vary)
+            # We use the model for validation, but basic check can help debugging
+            if not all(k in coll_stats_raw for k in ['ns', 'count', 'size', 'storageSize', 'nindexes', 'totalIndexSize']):
+                 print(f"Warning: collStats result might be missing expected fields: {coll_stats_raw.keys()}")
+                 # Allow Pydantic model to handle validation strictly
+            coll_stats = CollectionStats(**coll_stats_raw) # Validate and parse raw stats
+            print(f"Successfully fetched collStats.")
+
+        except OperationFailure as e:
+            print(f"Database error executing collStats for '{collection_name}': {e.details} (Code: {e.code})")
+            detail = f"Database command 'collStats' failed: {e.details}"
+            status_code = 500
+            if e.code == 13: status_code = 403; detail = "Authorization failed for collStats command."
+            raise HTTPException(status_code=status_code, detail=detail)
+        except ConnectionFailure as e:
+            print(f"Database connection failure during collStats for '{collection_name}': {e}")
+            raise HTTPException(status_code=503, detail="Database connection lost during stats retrieval.")
+        except Exception as e: # Catch Pydantic validation errors or other issues
+             print(f"Error processing collStats result for '{collection_name}': {type(e).__name__} - {e}")
+             traceback.print_exc()
+             raise HTTPException(status_code=500, detail=f"Failed to process collection statistics: {e}")
+
+
+        # 3. (Optional) Get distinct source URL count
+        print(f"Attempting to count distinct source URLs in '{collection_name}'...")
+        try:
+            # Check if any documents with the metadata field exist first (optimization)
+            has_metadata = collection.find_one({"metadata.original_url": {"$exists": True}}, {"_id": 1})
+            if has_metadata:
+                distinct_urls = collection.distinct("metadata.original_url")
+                distinct_urls_count = len(distinct_urls)
+                print(f"Found {distinct_urls_count} distinct source URLs.")
+            else:
+                distinct_urls_count = 0
+                stats_message = "No documents with 'metadata.original_url' found to count distinct sources."
+                print(stats_message)
+        except (OperationFailure, ConnectionFailure) as e:
+            print(f"Database error counting distinct URLs in '{collection_name}': {e}")
+            stats_message = f"Could not count distinct source URLs due to database error: {getattr(e, 'details', str(e))}"
+        except Exception as e:
+            print(f"Unexpected error counting distinct URLs in '{collection_name}': {e}")
+            stats_message = f"Unexpected error counting distinct source URLs: {e}"
+
+
+        # 4. Return the response
+        return CollectionStatsResponse(
+            collection_name=collection_name,
+            stats=coll_stats,
+            distinct_source_urls_count=distinct_urls_count,
+            message=stats_message
+        )
+
+    except HTTPException as e:
+        # Re-raise specific HTTP exceptions
+        raise e
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"Unexpected error in get_collection_stats for '{collection_name}': {type(e).__name__}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while getting collection stats: {e}")
 
 # --- Application startup ---
 if __name__ == "__main__":
