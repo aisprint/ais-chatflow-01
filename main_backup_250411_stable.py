@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Header, Depends, Body, Response, Pat
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, ConnectionFailure # MongoDB固有のエラー
-from pydantic import BaseModel, HttpUrl, Field, field_validator # field_validatorを追加
+from pydantic import BaseModel, HttpUrl, Field
 # from sentence_transformers import SentenceTransformer # 不要
 import openai # ★ OpenAIライブラリをインポート
 from openai import OpenAI # ★ 新しいAPI呼び出し形式 (v1.0.0以降)
@@ -132,34 +132,15 @@ class SearchResultItem(BaseModel):
     metadata: Dict[str, Any]
     score: float
 
-# --- ★★★ Vector Search Request Model Modified ★★★ ---
 class VectorSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query text")
-    # --- Modified field: collection_name -> collection_names ---
-    collection_names: List[str] = Field(..., min_length=1, description="List of collection names to search within (minimum 1)")
-    limit: int = Field(10, ge=1, le=100, description="Maximum number of results to return across all collections")
-    num_candidates: int = Field(100, ge=10, le=1000, description="Number of candidates for initial vector search phase within EACH collection")
-    filter: Optional[Dict[str, Any]] = Field(None, description="Optional filter criteria for metadata (applied within each collection)")
-
-    # --- Add validator for collection names ---
-    @field_validator('collection_names', mode='before')
-    @classmethod
-    def check_collection_names(cls, v):
-        if not isinstance(v, list):
-            raise ValueError("collection_names must be a list")
-        if not v:
-            raise ValueError("collection_names must not be empty")
-        # Ensure each name matches the allowed pattern
-        pattern = r"^[a-zA-Z0-9_.-]+$"
-        for name in v:
-            if not isinstance(name, str) or not re.match(pattern, name):
-                raise ValueError(f"Invalid collection name format: '{name}'. Must match pattern: {pattern}")
-        return v
+    collection_name: str = Field("documents", min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$", description="Name of the collection to search within")
+    limit: int = Field(10, ge=1, le=100, description="Maximum number of results to return")
+    num_candidates: int = Field(100, ge=10, le=1000, description="Number of candidates for initial vector search phase")
+    filter: Optional[Dict[str, Any]] = Field(None, description="Optional filter criteria for metadata")
 
 class VectorSearchResponse(BaseModel):
     results: List[SearchResultItem]
-    # Optional field to include information about collections that couldn't be searched
-    warnings: Optional[List[str]] = Field(None, description="List of warnings, e.g., collections not found or search errors")
 
 class SearchResponse(BaseModel):
     results: List[SearchResultItem]
@@ -597,7 +578,7 @@ def create_collection_endpoint(request: CollectionCreate, user: Dict = Depends(g
         raise HTTPException(status_code=500, detail=f"Failed to prepare collection '{request.name}': {e}")
 
 
-# ★★★ /process endpoint (unchanged in logic from previous version, just included for completeness) ★★★
+# ★★★ Modified /process endpoint ★★★
 @app.post("/process")
 async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_header)):
     """
@@ -1069,153 +1050,92 @@ async def search_documents(request: SearchRequest, user: Dict = Depends(get_user
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during search: {e}")
 
-# --- ★★★ Modified /vector-search Endpoint ★★★ ---
+# /vector-search uses Header auth
 @app.post("/vector-search", response_model=VectorSearchResponse)
 async def vector_search_documents(request: VectorSearchRequest, user: Dict = Depends(get_user_header)):
-    """
-    Performs vector-only search across multiple specified collections with optional metadata filtering.
-    Combines results, sorts by score, and applies limit. Requires X-API-Key header.
-    """
+    """Performs vector-only search with optional metadata filtering. Requires X-API-Key header."""
     index_name = "vector_index"
-    all_results = []
-    warnings = []
-    start_time_total = time.time()
-
-    print(f"Multi-collection vector search request: query='{request.query[:50]}...', collections={request.collection_names}, limit={request.limit}, filter={request.filter}, user={user.get('supabase_user_id')}")
+    print(f"Vector search request: query='{request.query[:50]}...', collection='{request.collection_name}', limit={request.limit}, filter={request.filter}, user={user.get('supabase_user_id')}")
 
     try:
-        # --- 1. Get User DB ---
         db = MongoDBManager.get_user_db(user)
-        db_name = db.name # For logging
-
-        # --- 2. Get Query Embedding (Once) ---
+        # Check if collection exists
         try:
-            start_time_embed = time.time()
+            if request.collection_name not in db.list_collection_names():
+                raise HTTPException(status_code=404, detail=f"Collection '{request.collection_name}' not found.")
+        except OperationFailure as e:
+            print(f"Database error listing collections during vector search: {e.details}")
+            raise HTTPException(status_code=503, detail=f"Database error checking collection existence: {e.details}")
+
+        collection = db[request.collection_name]
+
+        # 1. Get query embedding
+        try:
             query_embedding = await asyncio.to_thread(get_openai_embedding, request.query)
             if not query_embedding:
-                # No embedding possible, cannot search any collection
-                raise HTTPException(status_code=400, detail="Failed to generate embedding for the query. Cannot perform search.")
-            print(f"Query embedding generated in {time.time() - start_time_embed:.2f}s")
-        except HTTPException as e:
-            # Re-raise embedding errors (like OpenAI API issues) as they prevent any search
-            raise e
-        except Exception as e:
-            print(f"Unexpected error during query embedding: {type(e).__name__} - {e}")
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail="Failed to generate query embedding due to an unexpected error.")
+                raise HTTPException(status_code=400, detail="Failed to generate embedding for the query.")
+        except HTTPException as e: raise e
+        except Exception as e: print(f"Unexpected query embed err: {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail="Query embed fail.")
 
-        # --- 3. Define $vectorSearch Stage (base) ---
-        vector_search_stage_base = {
+        # 2. Define the $vectorSearch stage
+        vector_search_stage = {
             "$vectorSearch": {
                 "index": index_name,
                 "path": "embedding",
                 "queryVector": query_embedding,
-                "numCandidates": request.num_candidates,
-                "limit": request.limit # Fetch up to limit per collection initially
+                "numCandidates": request.num_candidates, # Number of candidates for initial search
+                "limit": request.limit # Final number of results to return
             }
         }
+
         # Add filter if provided
         if request.filter:
-            print(f"Applying metadata filter: {request.filter}")
-            vector_search_stage_base["$vectorSearch"]["filter"] = request.filter
+            print(f"Applying metadata filter to vector search: {request.filter}")
+            vector_search_stage["$vectorSearch"]["filter"] = request.filter
 
-        # --- 4. Define Projection Stage ---
-        project_stage = {
-            "$project": {
-                "_id": 0, # Exclude MongoDB ObjectId
-                "id": {"$toString": "$_id"}, # Return ID as string
-                "text": 1,
-                "metadata": 1,
-                "score": {"$meta": "vectorSearchScore"} # Get the similarity score
+        # 3. Define the aggregation pipeline
+        pipeline = [
+            vector_search_stage,
+            {
+                "$project": {
+                    "_id": 0, # Exclude MongoDB ObjectId
+                    "id": {"$toString": "$_id"}, # Return ID as string
+                    "text": 1,
+                    "metadata": 1,
+                    "score": {"$meta": "vectorSearchScore"} # Get the similarity score
+                }
             }
-        }
+        ]
 
-        # --- 5. Iterate Through Collections and Search ---
-        start_time_searches = time.time()
-        available_collections = set(db.list_collection_names()) # Get list of existing collections once
+        # 4. Execute the pipeline
+        start_time = time.time()
+        results = list(collection.aggregate(pipeline))
+        end_time = time.time()
 
-        for collection_name in request.collection_names:
-            start_time_coll = time.time()
-            # Check if collection exists
-            if collection_name not in available_collections:
-                warning_msg = f"Collection '{collection_name}' not found in database '{db_name}'."
-                print(f"Warning: {warning_msg}")
-                warnings.append(warning_msg)
-                continue # Skip to the next collection
+        print(f"Vector search executed in {end_time - start_time:.2f}s. Found {len(results)} results.")
 
-            print(f"Searching collection: '{collection_name}'...")
-            collection = db[collection_name]
-            pipeline = [vector_search_stage_base, project_stage] # Construct pipeline for this collection
+        # Format results (Pydantic model validation happens implicitly here)
+        formatted_results = [SearchResultItem(**res) for res in results]
 
-            try:
-                # Execute the pipeline for the current collection
-                results = list(collection.aggregate(pipeline))
-                print(f"Search in '{collection_name}' found {len(results)} results in {time.time() - start_time_coll:.2f}s.")
-                all_results.extend(results) # Add results from this collection to the main list
+        return VectorSearchResponse(results=formatted_results)
 
-            except OperationFailure as e:
-                print(f"Database error during vector search in collection '{collection_name}': {e.details} (Code: {e.code})")
-                detail = f"Database error in '{collection_name}': {e.details}"
-                status_code = 500
-                warning_msg = f"Search failed for collection '{collection_name}': "
-                if "index not found" in str(e.details).lower() or getattr(e, 'codeName', '') == 'IndexNotFound':
-                    warning_msg += f"Index '{index_name}' not found or not ready."
-                elif e.code == 13: warning_msg += "Authorization failed."
-                elif '$vectorSearch' in str(e.details):
-                     if 'queryVector' in str(e.details): warning_msg += f"Invalid query vector format/dimension."
-                     elif 'filter' in str(e.details): warning_msg += f"Invalid filter syntax/field."
-                     else: warning_msg += f"OperationFailure ({e.details})."
-                else: warning_msg += f"OperationFailure ({e.details})."
-                warnings.append(warning_msg)
-                # Continue to the next collection even if one fails
+    except OperationFailure as e:
+        print(f"Database error during vector search: {e.details} (Code: {e.code})")
+        detail = f"Database error during vector search: {e.details}"
+        status_code = 500
+        if "index not found" in str(e.details).lower() or getattr(e, 'codeName', '') == 'IndexNotFound':
+            status_code = 404
+            detail = f"Search index '{index_name}' not found or not ready in collection '{request.collection_name}'."
+        elif e.code == 13: status_code = 403; detail = "Authorization failed for search operation."
+        elif '$vectorSearch' in str(e.details):
+             # Try to provide more specific feedback for common vector search issues
+             if 'queryVector' in str(e.details): status_code=400; detail = f"Invalid query vector format or dimension. {e.details}"
+             elif 'filter' in str(e.details): status_code=400; detail = f"Invalid filter syntax or field name. {e.details}"
 
-            except ConnectionFailure as e:
-                 # If connection fails, it likely affects all subsequent operations, so raise
-                 print(f"Database connection failure during search in '{collection_name}': {e}")
-                 raise HTTPException(status_code=503, detail=f"Database connection lost while searching '{collection_name}'.")
-
-            except Exception as e:
-                print(f"Unexpected error during vector search in collection '{collection_name}': {type(e).__name__} - {e}")
-                traceback.print_exc()
-                warnings.append(f"Unexpected error searching collection '{collection_name}': {str(e)}")
-                # Continue to the next collection
-
-        print(f"Finished searching all requested collections in {time.time() - start_time_searches:.2f}s. Total raw results: {len(all_results)}")
-
-        # --- 6. Combine, Sort, and Limit Results ---
-        if not all_results:
-            print("No results found across all searched collections.")
-            # Decide on status code: 200 OK with empty list, or 404 if all requested collections were not found?
-            # Let's return 200 OK with empty list and warnings if applicable.
-            return VectorSearchResponse(results=[], warnings=warnings if warnings else None)
-
-        # Sort all collected results by score (descending)
-        start_time_sort = time.time()
-        all_results.sort(key=lambda x: x['score'], reverse=True)
-
-        # Apply the final limit
-        final_results = all_results[:request.limit]
-        print(f"Sorted and limited results ({len(final_results)}) in {time.time() - start_time_sort:.2f}s.")
-
-        # --- 7. Format and Return Response ---
-        formatted_results = [SearchResultItem(**res) for res in final_results]
-        total_time = time.time() - start_time_total
-        print(f"Total vector search process took {total_time:.2f}s")
-
-        return VectorSearchResponse(results=formatted_results, warnings=warnings if warnings else None)
-
-    except HTTPException as e:
-        # Re-raise specific HTTP exceptions (e.g., from embedding generation or critical DB errors)
-        raise e
-    except (OperationFailure, ConnectionFailure) as e:
-         # Catch DB errors happening outside the loop (e.g., listing collections)
-         print(f"Database error during vector search setup: {e}")
-         detail = f"Database error during search setup: {getattr(e, 'details', str(e))}"
-         status_code = 503 if isinstance(e, ConnectionFailure) else 500
-         raise HTTPException(status_code=status_code, detail=detail)
+        raise HTTPException(status_code=status_code, detail=detail)
+    except HTTPException as e: raise e
     except Exception as e:
-        # Catch any other unexpected errors
-        print(f"Unexpected error during multi-collection vector search: {type(e).__name__} - {e}")
+        print(f"Unexpected error during vector search: {type(e).__name__} - {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during vector search: {e}")
 
