@@ -29,8 +29,30 @@ from typing import List, Optional # Optionalを追加
 from pydantic import BaseModel, Field, HttpUrl # BaseModel, Field は既存だが明示
 from bson import ObjectId # 結果のID変換用
 
+# ★★★ CORSミドルウェアをインポート ★★★
+from fastapi.middleware.cors import CORSMiddleware
+
+
 # FastAPI app initialization
 app = FastAPI()
+
+# ★★★ CORSミドルウェアの設定を追加 ★★★
+# 許可するオリジン (開発中は "*" で全て許可し、本番環境ではフロントエンドのドメインを指定)
+origins = [
+    "*",  # すべてのオリジンを許可 (テスト用)
+    # "http://localhost",
+    # "http://localhost:3000", # フロントエンドが動作しているオリジンなど
+    # "https://your-frontend-domain.com",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # 許可するオリジンのリスト
+    allow_credentials=True,  # クレデンシャル（Cookie、Authorizationヘッダーなど）を許可
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # 許可するHTTPメソッド (DELETEとOPTIONSを含む)
+    allow_headers=["*", "X-API-Key"],  # 許可するHTTPヘッダー (X-API-Keyを含む)
+)
+
 
 load_dotenv()
 
