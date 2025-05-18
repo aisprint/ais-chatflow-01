@@ -198,6 +198,7 @@ def verify_admin(api_key: str = Header(..., alias="X-API-Key")):
         raise HTTPException(status_code=403, detail="Admin access required. Invalid API Key provided.")
 
 def get_user_header(api_key: str = Header(..., alias="X-API-Key")):
+    print(f"Received headers in get_user_header: {all_headers}") 
     if auth_db is None:
          print("Error in get_user_header: auth_db is not available.")
          raise HTTPException(status_code=503, detail="Database service unavailable")
