@@ -187,6 +187,7 @@ class CollectionStatsResponse(BaseModel):
     collection_name: str
     stats: CollectionStats
     distinct_source_urls_count: Optional[int] = Field(None, description="Number of distinct source PDF URLs processed into this collection. Can be null if check fails or no metadata found.")
+    distinct_source_page_numbers_count: Optional[int] = Field(None, description="Number of distinct page numbers from PDF sources. Applicable for PDF type collections.")
     message: Optional[str] = None
 
 # --- Dependencies ---
@@ -437,7 +438,7 @@ def _recursive_json_extractor(data_node: Any, parent_url: Optional[str] = None) 
         if isinstance(current_text_val, str) and current_text_val.strip():
             meta = {}
             if effective_url_for_node:
-                 meta["source_json_url"] = effective_url_for_node
+                 meta["source_json_url"] = effective_url_for_node # For JSON, use source_json_url
             extracted_items.append((current_text_val, meta))
         
         # Recursively process other values in the dictionary
@@ -461,7 +462,7 @@ def _recursive_json_extractor(data_node: Any, parent_url: Optional[str] = None) 
         # Associate it with the parent_url from its context
         meta = {}
         if parent_url:
-            meta["source_json_url"] = parent_url
+            meta["source_json_url"] = parent_url # For JSON, use source_json_url
         extracted_items.append((data_node, meta))
     
     return extracted_items
@@ -577,23 +578,34 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
         if detected_file_type == 'pdf':
             try:
                 pdf_content_stream = io.BytesIO(file_bytes)
-                def extract_text_from_pdf_sync(pdf_stream_sync):
-                    reader = PyPDF2.PdfReader(pdf_stream_sync)
-                    if reader.is_encrypted: raise ValueError("Encrypted PDFs not supported.")
-                    return "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
                 
-                pdf_text = await asyncio.to_thread(extract_text_from_pdf_sync, pdf_content_stream)
-                if pdf_text and not pdf_text.isspace():
-                    texts_to_process.append((pdf_text, {})) # No segment-specific metadata for whole PDF text
+                # --- PDF Page Number Logic START ---
+                def extract_text_and_page_numbers_from_pdf_sync(pdf_stream_sync):
+                    reader = PyPDF2.PdfReader(pdf_stream_sync)
+                    if reader.is_encrypted:
+                        raise ValueError("Encrypted PDFs not supported.")
+                    
+                    _texts_with_meta = []
+                    for i, page_obj in enumerate(reader.pages):
+                        page_text = page_obj.extract_text()
+                        if page_text and not page_text.isspace():
+                            # Store page text along with its page number
+                            page_meta = {"source_document_page_number": i + 1}
+                            _texts_with_meta.append((page_text, page_meta))
+                    return _texts_with_meta
+                
+                texts_to_process = await asyncio.to_thread(extract_text_and_page_numbers_from_pdf_sync, pdf_content_stream)
+                # --- PDF Page Number Logic END ---
+
             except PyPDF2.errors.PdfReadError as pdf_err: raise HTTPException(status_code=400, detail=f"Invalid or corrupted PDF: {pdf_err}")
-            except ValueError as e: raise HTTPException(status_code=400, detail=str(e)) # For encryption error
+            except ValueError as e: raise HTTPException(status_code=400, detail=str(e)) # For encryption error or other ValueErrors
             except Exception as e: print(f"PDF processing error: {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"PDF processing failed: {e}")
 
         elif detected_file_type == 'txt':
             try:
                 txt_text = decode_bytes_with_fallbacks(file_bytes)
                 if txt_text and not txt_text.isspace():
-                    texts_to_process.append((txt_text, {}))
+                    texts_to_process.append((txt_text, {})) # No specific segment meta for whole TXT
             except ValueError as e: # From decode_bytes_with_fallbacks
                 raise HTTPException(status_code=400, detail=str(e))
             except Exception as e: print(f"TXT processing error: {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"TXT processing failed: {e}")
@@ -602,7 +614,9 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
             try:
                 json_string_content = decode_bytes_with_fallbacks(file_bytes)
                 json_data = json.loads(json_string_content)
-                texts_to_process = _recursive_json_extractor(json_data) # Returns List[Tuple[str, Dict]]
+                # _recursive_json_extractor returns List[Tuple[str, Dict]], 
+                # where Dict might contain "source_json_url"
+                texts_to_process = _recursive_json_extractor(json_data)
             except ValueError as e: # From decode_bytes_with_fallbacks
                 raise HTTPException(status_code=400, detail=str(e))
             except json.JSONDecodeError as e_json:
@@ -638,10 +652,15 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
                 print(f"Skipping empty text segment {segment_idx + 1}/{num_segments}.")
                 continue
 
+            # For PDF, segment_meta will contain {"source_document_page_number": X}
+            # For JSON, segment_meta might contain {"source_json_url": "..."}
+            # For TXT, segment_meta will be {} initially.
+
             start_time_split = time.time()
             chunks = split_text_into_chunks(text_segment)
             end_time_split = time.time()
-            print(f"Segment {segment_idx + 1}/{num_segments} split into {len(chunks)} chunks ({end_time_split - start_time_split:.2f}s).")
+            print(f"Segment {segment_idx + 1}/{num_segments} (Meta: {segment_meta}) split into {len(chunks)} chunks ({end_time_split - start_time_split:.2f}s).")
+
 
             if not chunks:
                 print(f"Segment {segment_idx + 1}/{num_segments} resulted in zero chunks after splitting.")
@@ -666,15 +685,19 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
                         continue
 
                     # Construct metadata for this chunk
+                    # segment_meta already contains source_document_page_number for PDFs
+                    # or source_json_url for JSONs
                     chunk_metadata = {
                         **request.metadata,          # Base metadata from request
-                        **segment_meta,              # Metadata from JSON segment (e.g., source_json_url)
+                        **segment_meta,              # Metadata from PDF page or JSON segment
                         "chunk_index_in_segment": chunk_idx_in_segment,
-                        "segment_index": segment_idx,
+                        "segment_index": segment_idx, # If PDF, this is page index (0-based)
                         "original_url": file_url_for_logging, # URL the file was downloaded from
                         "processed_at": datetime.utcnow(),
                         "file_type": detected_file_type
                     }
+                    # If it's not a PDF, and segment_meta was empty, ensure page number is not added.
+                    # The `**segment_meta` handles this correctly.
 
                     doc_to_insert = {
                         "text": chunk_text, 
@@ -692,7 +715,7 @@ async def process_pdf(request: ProcessRequest, user: Dict = Depends(get_user_hea
                     if insert_result.inserted_id:
                         inserted_count += 1
                         if inserted_count % 20 == 0 or inserted_count == 1: # Log progress
-                             print(f"Processed and inserted chunk {inserted_count} (global: {processed_chunks_count}). Embed: {end_time_embed-start_time_embed:.2f}s, Insert: {end_time_insert-start_time_insert:.2f}s")
+                             print(f"Processed and inserted chunk {inserted_count} (global: {processed_chunks_count}). Meta: {chunk_metadata}. Embed: {end_time_embed-start_time_embed:.2f}s, Insert: {end_time_insert-start_time_insert:.2f}s")
                     else:
                         errors.append({"chunk_text_start": chunk_text[:50], "error": "MongoDB insert_one did not return an inserted_id", "status_code": 500})
 
@@ -969,7 +992,7 @@ async def rename_collection_endpoint(current_name: str = Path(..., min_length=1,
 @app.get("/collections/{collection_name}/stats", response_model=CollectionStatsResponse)
 def get_collection_stats(collection_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$"), user: Dict = Depends(get_user_header)):
     print(f"Request stats for '{collection_name}' for user {user.get('supabase_user_id')}")
-    distinct_urls_count = None; stats_message = None
+    distinct_urls_count = None; distinct_page_nums_count = None; stats_message = None
     try:
         db = MongoDBManager.get_user_db(user); db_name = db.name
         try:
@@ -987,14 +1010,36 @@ def get_collection_stats(collection_name: str = Path(..., min_length=1, pattern=
         except ConnectionFailure as e: raise HTTPException(status_code=503, detail="DB connection lost during stats.")
         except Exception as e: print(f"Error processing collStats: {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Failed to process stats: {e}")
         
+        # Count distinct original_urls
         try:
             if collection.find_one({"metadata.original_url": {"$exists": True}}, {"_id": 1}):
                 distinct_urls_count = len(collection.distinct("metadata.original_url"))
-            else: distinct_urls_count = 0; stats_message = "No 'metadata.original_url' found."
-        except (OperationFailure, ConnectionFailure) as e: stats_message = f"Could not count distinct URLs (DB error): {getattr(e, 'details', str(e))}"
-        except Exception as e: stats_message = f"Could not count distinct URLs (unexpected error): {e}"
+            else: distinct_urls_count = 0; stats_message = (stats_message or "") + " No 'metadata.original_url' found for distinct count."
+        except (OperationFailure, ConnectionFailure) as e: stats_message = (stats_message or "") + f" Could not count distinct URLs (DB error): {getattr(e, 'details', str(e))}"
+        except Exception as e: stats_message = (stats_message or "") + f" Could not count distinct URLs (unexpected error): {e}"
+
+        # Count distinct source_document_page_numbers (only if metadata indicates PDF was processed)
+        try:
+            # Check if any document in the collection has the page number metadata key,
+            # implying it might contain PDF-derived chunks.
+            if collection.find_one({"metadata.source_document_page_number": {"$exists": True}}, {"_id": 1}):
+                distinct_page_nums_count = len(collection.distinct("metadata.source_document_page_number"))
+            elif distinct_urls_count == 0 and stats_message and "No 'metadata.original_url' found" in stats_message :
+                # If no URLs, imply no PDF pages either if we assume PDF is the primary source of page numbers
+                distinct_page_nums_count = 0
+            # else: leave as None if the key simply doesn't exist across the collection (not necessarily an error)
+        except (OperationFailure, ConnectionFailure) as e:
+            stats_message = (stats_message or "") + f" Could not count distinct page numbers (DB error): {getattr(e, 'details', str(e))}"
+        except Exception as e:
+            stats_message = (stats_message or "") + f" Could not count distinct page numbers (unexpected error): {e}"
         
-        return CollectionStatsResponse(collection_name=collection_name, stats=coll_stats, distinct_source_urls_count=distinct_urls_count, message=stats_message)
+        return CollectionStatsResponse(
+            collection_name=collection_name, 
+            stats=coll_stats, 
+            distinct_source_urls_count=distinct_urls_count,
+            distinct_source_page_numbers_count=distinct_page_nums_count,
+            message=stats_message.strip() if stats_message else None
+        )
     except HTTPException as e: raise e
     except Exception as e: print(f"Unexpected error in get_collection_stats for '{collection_name}': {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected error getting stats: {e}")
 
