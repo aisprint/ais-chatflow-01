@@ -8,6 +8,7 @@ import traceback # エラー詳細表示のため
 import re # rename エンドポイントの検証用に追加
 import sys # SystemExit用に追加
 import json # JSON処理用に追加
+import uuid # UUID validation用に追加
 
 import requests
 import PyPDF2
@@ -24,6 +25,8 @@ from openai import OpenAI # ★ 新しいAPI呼び出し形式 (v1.0.0以降)
 from dotenv import load_dotenv
 import asyncio
 import time
+# Supabase接続用
+from supabase import create_client, Client
 
 from typing import List, Optional # Optionalを追加
 from pydantic import BaseModel, Field, HttpUrl # BaseModel, Field は既存だが明示
@@ -63,9 +66,12 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2") # Note: This 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # ★ OpenAI APIキー
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002") # ★ 使用するモデル (デフォルト設定)
+# Supabase接続情報
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 # --- Validate required environment variables on startup ---
-required_env_vars = ["MONGO_MASTER_URI", "ADMIN_API_KEY", "OPENAI_API_KEY"]
+required_env_vars = ["MONGO_MASTER_URI", "ADMIN_API_KEY", "OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_ANON_KEY"]
 missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
 if missing_vars:
     print(f"FATAL: Missing required environment variables: {', '.join(missing_vars)}")
@@ -78,6 +84,14 @@ try:
 except Exception as e:
     print(f"FATAL: Failed to initialize OpenAI client: {e}")
     raise SystemExit(f"Failed to initialize OpenAI client: {e}")
+
+# --- Supabase Client Initialization ---
+try:
+    supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    print("Supabase client initialized successfully.")
+except Exception as e:
+    print(f"FATAL: Failed to initialize Supabase client: {e}")
+    raise SystemExit(f"Failed to initialize Supabase client: {e}")
 
 # --- MongoDB Connection ---
 mongo_client = None
@@ -964,30 +978,101 @@ async def delete_collection_endpoint(collection_name: str = Path(..., min_length
     except HTTPException as e: raise e
     except Exception as e: print(f"Unexpected error deleting '{collection_name}': {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected error during deletion: {e}")
 
-@app.put("/collections/{current_name}", response_model=ActionResponse)
-async def rename_collection_endpoint(current_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$"), request: RenameCollectionBody = Body(...), user: Dict = Depends(get_user_header)):
+@app.put("/collections/{collection_id}", response_model=ActionResponse)
+async def rename_collection_endpoint(collection_id: str = Path(..., description="Collection ID (UUID)"), request: RenameCollectionBody = Body(...), user: Dict = Depends(get_user_header)):
     new_name = request.new_name
-    print(f"Request to rename '{current_name}' to '{new_name}' for user {user.get('supabase_user_id')}")
-    if current_name == new_name: raise HTTPException(status_code=400, detail="New name cannot be same as current.")
+    print(f"Request to rename collection '{collection_id}' to '{new_name}' for user {user.get('supabase_user_id')}")
+    
+    # Validate UUID format
+    if not validate_uuid(collection_id):
+        raise HTTPException(status_code=400, detail="Invalid collection_id format. Must be a valid UUID.")
+    
     try:
-        db = MongoDBManager.get_user_db(user); db_name = db.name
-        collection_names = db.list_collection_names()
-        if current_name not in collection_names: raise HTTPException(status_code=404, detail=f"Source collection '{current_name}' not found.")
-        if new_name in collection_names: raise HTTPException(status_code=409, detail=f"Target collection '{new_name}' already exists.")
+        # Step 1: Get collection information from Supabase
         try:
-            if mongo_client is None: raise HTTPException(status_code=503, detail="DB client unavailable for rename.")
-            mongo_client.admin.command('renameCollection', f'{db_name}.{current_name}', to=f'{db_name}.{new_name}')
-            warning_detail = "Important: Atlas Search indexes must be manually recreated for the new collection name."
-            return ActionResponse(status="success", message=f"Collection '{current_name}' renamed to '{new_name}'.", details=warning_detail)
+            supabase_response = supabase_client.table('collections').select('collection_name, supabase_user_id').eq('collection_id', collection_id).execute()
+            
+            if not supabase_response.data:
+                raise HTTPException(status_code=404, detail=f"Collection with ID '{collection_id}' not found in Supabase.")
+            
+            collection_data = supabase_response.data[0]
+            current_collection_name = collection_data['collection_name']
+            collection_owner_id = collection_data['supabase_user_id']
+            
+            # Verify ownership
+            if collection_owner_id != user.get('supabase_user_id'):
+                raise HTTPException(status_code=403, detail="You don't have permission to rename this collection.")
+                
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            print(f"Supabase error: {e}")
+            raise HTTPException(status_code=503, detail="Failed to access collection information from Supabase.")
+        
+        # Step 2: Check if new name is different
+        if current_collection_name == new_name:
+            raise HTTPException(status_code=400, detail="New name cannot be same as current.")
+        
+        # Step 3: Check MongoDB collection existence and conflicts
+        db = MongoDBManager.get_user_db(user)
+        db_name = db.name
+        collection_names = db.list_collection_names()
+        
+        if current_collection_name not in collection_names:
+            raise HTTPException(status_code=404, detail=f"Source collection '{current_collection_name}' not found in MongoDB.")
+        if new_name in collection_names:
+            raise HTTPException(status_code=409, detail=f"Target collection '{new_name}' already exists in MongoDB.")
+        
+        # Step 4: Update Supabase first
+        try:
+            supabase_update_response = supabase_client.table('collections').update({'collection_name': new_name}).eq('collection_id', collection_id).execute()
+            
+            if not supabase_update_response.data:
+                raise HTTPException(status_code=500, detail="Failed to update collection name in Supabase.")
+                
+        except Exception as e:
+            print(f"Supabase update error: {e}")
+            raise HTTPException(status_code=503, detail="Failed to update collection name in Supabase.")
+        
+        # Step 5: Update MongoDB collection name
+        try:
+            if mongo_client is None:
+                raise HTTPException(status_code=503, detail="DB client unavailable for rename.")
+            
+            mongo_client.admin.command('renameCollection', f'{db_name}.{current_collection_name}', to=f'{db_name}.{new_name}')
+            
         except OperationFailure as e:
-            detail = f"DB rename failed: {e.details}"; status_code = 500
-            if e.code == 13: status_code = 403; detail = "Auth error for rename."
-            elif e.code == 10026: status_code = 409; detail = f"Target '{new_name}' already exists."
-            elif e.code == 26: status_code = 404; detail = f"Source '{current_name}' not found."
+            # Rollback Supabase update if MongoDB fails
+            try:
+                supabase_client.table('collections').update({'collection_name': current_collection_name}).eq('collection_id', collection_id).execute()
+            except Exception as rollback_error:
+                print(f"Failed to rollback Supabase update: {rollback_error}")
+            
+            detail = f"DB rename failed: {e.details}"
+            status_code = 500
+            if e.code == 13:
+                status_code = 403
+                detail = "Auth error for rename."
+            elif e.code == 10026:
+                status_code = 409
+                detail = f"Target '{new_name}' already exists."
+            elif e.code == 26:
+                status_code = 404
+                detail = f"Source '{current_collection_name}' not found."
             raise HTTPException(status_code=status_code, detail=detail)
-    except ConnectionFailure as e: print(f"DB connection failure for rename: {e}"); raise HTTPException(status_code=503, detail="DB connection lost.")
-    except HTTPException as e: raise e
-    except Exception as e: print(f"Unexpected error renaming '{current_name}': {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected error during rename: {e}")
+        
+        warning_detail = "Important: Atlas Search indexes must be manually recreated for the new collection name."
+        return ActionResponse(status="success", message=f"Collection '{current_collection_name}' renamed to '{new_name}'.", details=warning_detail)
+        
+    except HTTPException as e:
+        raise e
+    except ConnectionFailure as e:
+        print(f"DB connection failure for rename: {e}")
+        raise HTTPException(status_code=503, detail="DB connection lost.")
+    except Exception as e:
+        print(f"Unexpected error renaming collection '{collection_id}': {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error during rename: {e}")
 
 @app.get("/collections/{collection_name}/stats", response_model=CollectionStatsResponse)
 def get_collection_stats(collection_name: str = Path(..., min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$"), user: Dict = Depends(get_user_header)):
@@ -1043,12 +1128,22 @@ def get_collection_stats(collection_name: str = Path(..., min_length=1, pattern=
     except HTTPException as e: raise e
     except Exception as e: print(f"Unexpected error in get_collection_stats for '{collection_name}': {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Unexpected error getting stats: {e}")
 
+# --- Helper functions ---
+def validate_uuid(uuid_string: str) -> bool:
+    """Validate if the string is a valid UUID format."""
+    try:
+        uuid.UUID(uuid_string)
+        return True
+    except ValueError:
+        return False
+
 # --- Application startup ---
 if __name__ == "__main__":
     startup_errors = []
     if mongo_client is None: startup_errors.append("MongoDB Client is None")
     if auth_db is None: startup_errors.append("MongoDB Auth DB is None")
     if openai_client is None: startup_errors.append("OpenAI Client is None")
+    if supabase_client is None: startup_errors.append("Supabase Client is None")
     if startup_errors:
          print("FATAL: Required clients not initialized. Server cannot start.")
          for error in startup_errors: print(f" - {error}")
